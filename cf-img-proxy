@@ -1,0 +1,830 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  img.zoio.net — Cloudflare Workers 图片反向代理
+ *  版本：v1.3
+ *
+ *  用途：为中国用户提供 Blogger 博客图片的稳定访问与 CDN 加速
+ *  架构：CF Workers Edge → Blogger CDN（bp.blogspot.com）
+ *  调用：https://img.zoio.net/?url=<Blogger图片URL>
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIG：所有可调参数统一管理，业务代码中无魔法常量
+// ─────────────────────────────────────────────────────────────────────────────
+const CONFIG = Object.freeze({
+
+  // 上游请求超时（毫秒）
+  TIMEOUT_PRIMARY:     5_000,  // 主源 GET 超时
+  TIMEOUT_FALLBACK:    4_000,  // 备用源并发竞争超时
+  TIMEOUT_HEAD_PROBE:  3_000,  // HEAD 探测超时（不读 body，可更短）
+
+  // 请求去重 TTL（毫秒）
+  // 设为主源 + 备用源超时 + body 读取缓冲之和，覆盖完整回源链路。
+  // TTL 到期时同时触发 AbortController.abort()，真正中止底层 fetch 连接，
+  // 防止上游卡死时 pendingRequests Map 条目永远不被清理。
+  PENDING_TTL:        13_000,  // 5s + 4s + 3s + 1s 余量
+
+  // pendingRequests Map 大小上限，超出时返回 503 过载占位图
+  MAX_PENDING:           200,
+
+  // 响应体大小上限（字节）
+  // 含尺寸路径（/s800/ 等）视为缩略图；/s0/ 或无法识别路径视为原图
+  MAX_BYTES_THUMBNAIL:  2 * 1024 * 1024,   // 2 MB
+  MAX_BYTES_ORIGINAL:  12 * 1024 * 1024,   // 12 MB
+
+  // 缓存时效（秒）
+  // Blogger 图片 URL 含内容哈希，内容变更时 URL 一定改变，旧 URL 内容真正不可变
+  CACHE_TTL:          31_536_000,  // 主源图片：1 年（含 immutable 指令）
+  FALLBACK_CACHE_TTL:        300,  // fallback 图片：5 分钟（主源恢复后自动刷新）
+  PLACEHOLDER_TTL:            60,  // 占位图：60 秒（上游恢复后刷新可见真实图片）
+
+  // 上游请求伪装头
+  // UA 伪装 Chrome：通过 Blogger CDN 基础防爬检测
+  // Referer 伪装 Google：绕过 Blogger 服务端 Referer 防盗链限制
+  UPSTREAM_UA:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+    "Chrome/135.0.0.0 Safari/537.36",
+  UPSTREAM_REFERER: "https://www.google.com/",
+
+  // 允许代理的上游域名白名单（精确匹配或子域名匹配）
+  // 仅代理 Blogger 官方图片域名，防止 Worker 被当作通用代理滥用
+  ALLOWED_UPSTREAM_HOSTS: [
+    "bp.blogspot.com",
+    "blogger.googleusercontent.com",
+  ],
+
+  // Referer 防盗链白名单（精确匹配或子域名匹配）
+  // 空 Referer（直接访问、curl、开发调试等场景）默认放行
+  // 违规时返回占位图而非 403，避免第三方页面出现破图图标
+  ALLOWED_REFERER_HOSTS: [
+    "zoio.net",
+    "iyio.net",
+    "zoio-net.blogspot.com",
+    "zoiolab.blogspot.com",
+    "google.com",
+    "bing.com",
+    "t.me",
+    "x.com",
+    "twitter.com",
+    "facebook.com",
+    "baidu.com",
+    "duckduckgo.com",
+    "yandex.com",
+  ],
+
+  // 占位图 SVG 画布尺寸（像素）
+  PLACEHOLDER_W: 640,
+  PLACEHOLDER_H: 360,
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 客户端格式能力分级
+//
+// Blogger CDN 根据 Accept 头进行内容协商，对支持 AVIF/WebP 的客户端返回更优格式。
+// 若统一发送 "image/avif"，iOS 15 以下、部分旧版 Android WebView 等不支持 AVIF
+// 的设备会显示空白图片。因此按客户端能力划分三档：
+//   avif → Chrome 85+、Firefox 93+、Safari 16+
+//   webp → Safari 14-15、部分旧版 Android
+//   base → 极老设备（仅支持 JPEG/PNG/GIF）
+//
+// fmt 同时作为 cacheKey 的一部分（?fmt=avif|webp|base），
+// 确保同一图片的三种格式版本在 Worker Cache 中完全隔离，互不污染。
+//
+// 必须完整解析 q 值：Accept: image/avif;q=0 表示明确拒绝该格式，
+// 若用 .includes() 简化判断会将其误判为支持，导致该设备收到无法解码的图片。
+// ─────────────────────────────────────────────────────────────────────────────
+function resolveClientFmt(acceptHeader) {
+  if (!acceptHeader) return "base";
+
+  const supported = new Set();
+  for (const item of acceptHeader.split(",")) {
+    const parts = item.trim().split(";");
+    const mime  = parts[0].trim();
+    let q = 1;  // q 值默认为 1（最高优先级）
+    for (const p of parts.slice(1)) {
+      const [k, v] = p.trim().split("=");
+      if (k.trim() === "q") { q = parseFloat(v) || 0; break; }
+    }
+    if (q > 0) supported.add(mime);  // q=0 为明确拒绝，不加入支持集合
+  }
+
+  if (supported.has("image/avif")) return "avif";
+  if (supported.has("image/webp")) return "webp";
+  return "base";
+}
+
+// 各格式档位对应向上游 Blogger CDN 发送的 Accept 头
+const FMT_ACCEPT = Object.freeze({
+  avif: "image/avif,image/webp,image/*,*/*;q=0.8",
+  webp: "image/webp,image/*,*/*;q=0.8",
+  base: "image/jpeg,image/png,image/gif,image/*,*/*;q=0.8",
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// pendingRequests：请求去重表（Worker isolate 生命周期内有效）
+//
+// 热点图片高并发访问时，多个请求同时 MISS 缓存，若每个都独立回源会浪费配额。
+// 此 Map 将相同 URL + fmt 的并发请求合并为一次上游请求，结果广播给所有等待者。
+//
+// key：`${targetUrl}::${fmt}`
+// value：{ promise, abort, timer }
+//   promise — 所有等待者 await 同一个 Promise，结果共享
+//   abort   — AbortController，TTL 到期时真正中止底层 fetch 连接
+//   timer   — PENDING_TTL 定时器，正常完成时取消
+// ─────────────────────────────────────────────────────────────────────────────
+const pendingRequests = new Map();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Worker 入口
+// ─────────────────────────────────────────────────────────────────────────────
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      return await handleRequest(request, ctx);
+    } catch (err) {
+      console.error("[proxy][FATAL]", err?.message ?? String(err));
+      return plainTextResponse("Internal Server Error", 500);
+    }
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// handleRequest：主请求处理流程
+// 线性管道设计：每步校验失败立即返回，无深层嵌套
+// ─────────────────────────────────────────────────────────────────────────────
+async function handleRequest(request, ctx) {
+  const reqUrl = new URL(request.url);
+  const method = request.method;  // Fetch 规范保证标准方法已大写
+
+  // Step 1：HTTP 方法校验
+  if (method !== "GET" && method !== "HEAD") {
+    return plainTextResponse("Method Not Allowed", 405, { Allow: "GET, HEAD" });
+  }
+
+  // Step 2：解析 ?url= 参数并规范化
+  // 支持三种输入：完整 URL / 省略协议（//host）/ 纯域名（host/path）
+  const rawTarget = reqUrl.searchParams.get("url");
+  if (!rawTarget) return landingPageResponse();
+
+  const parsedTarget = normalizeUrl(rawTarget);
+  if (!parsedTarget) return plainTextResponse("Bad Request: invalid URL", 400);
+
+  const target = parsedTarget.href;
+
+  // Step 3：防环路
+  // 防止 ?url=https://img.zoio.net/... 导致 Worker 无限自我调用
+  if (parsedTarget.hostname === reqUrl.hostname) {
+    return plainTextResponse("Forbidden: loop detected", 403);
+  }
+
+  // Step 4：上游域名白名单
+  // 仅代理 Blogger 官方图片域名，防止 Worker 被当作通用代理滥用
+  if (!isAllowedUpstreamHost(parsedTarget.hostname)) {
+    return plainTextResponse("Forbidden: upstream host not allowed", 403);
+  }
+
+  // Step 4.5：强制 HTTPS 协议
+  // normalizeUrl 对省略协议和纯域名会补全 https://，但对显式传入的 http:// 不修改。
+  // 此步骤拒绝明文 HTTP 上游请求，防止产生不必要的明文出站连接。
+  if (parsedTarget.protocol !== "https:") {
+    return plainTextResponse("Bad Request: only HTTPS upstream allowed", 400);
+  }
+
+  // Step 5：Referer 防盗链
+  // 空 Referer 放行；携带 Referer 时必须在白名单内
+  const referer = request.headers.get("Referer") || "";
+  if (referer && !isAllowedRefererHost(getHostname(referer))) {
+    return makePlaceholderResponse(403, "不允许盗链");
+  }
+
+  // Step 6：格式分级 + 构造规范化 cacheKey
+  // fmt 纳入 cacheKey，确保 avif/webp/base 三种格式的缓存完全隔离
+  const fmt      = resolveClientFmt(request.headers.get("Accept") || "");
+  const cache    = caches.default;
+  const reqBase  = `${reqUrl.origin}${reqUrl.pathname}`;
+  const cacheKey = buildCacheKey(reqBase, target, fmt);
+
+  // Step 7：Worker Cache 命中查询
+  // 使用 Worker Cache 而非 CF 内置缓存，原因：CF 内置缓存不感知 Accept 头，
+  // 会导致 avif/webp/base 三种版本互相污染
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    const h = new Headers(cached.headers);
+    h.set("X-Cache-Status", "HIT");
+    return new Response(method === "HEAD" ? null : cached.body, {
+      status: cached.status, headers: h,
+    });
+  }
+
+  // Step 8：HEAD 方法——轻量真实上游探测
+  // 缓存 MISS 时不走完整回源流程，向上游发 HEAD 获取真实状态码。
+  // 使 SEO 爬虫、监控系统、浏览器预加载拿到准确的资源存在性信息。
+  if (method === "HEAD") {
+    return await probeUpstreamHead(target, fmt);
+  }
+
+  // Step 9：请求去重
+  // 并发热点请求命中此分支，等待首次请求完成后复用结果，避免重复回源
+  const dedupeKey = `${target}::${fmt}`;
+  const existing  = pendingRequests.get(dedupeKey);
+  if (existing) {
+    const recipe = await existing.promise;
+    return buildResponseFromRecipe(recipe);
+  }
+
+  // Step 10：过载熔断
+  // 超过 MAX_PENDING 时拒绝追加新的上游连接，防止出站连接数爆炸
+  if (pendingRequests.size >= CONFIG.MAX_PENDING) {
+    console.warn("[proxy][OVERLOAD] size =", pendingRequests.size);
+    return makePlaceholderResponse(503, "服务繁忙");
+  }
+
+  // Step 11：首次请求，发起回源
+  const abortCtrl    = new AbortController();
+  const recipePromise = fetchImageRecipe(
+    reqBase, target, parsedTarget, fmt, cacheKey, cache, ctx, abortCtrl.signal
+  );
+  const entry = { promise: recipePromise, abort: abortCtrl, timer: null };
+  pendingRequests.set(dedupeKey, entry);
+
+  // PENDING_TTL 超时保险：上游卡死时强制中止连接并清理 Map，防内存泄漏
+  entry.timer = setTimeout(() => {
+    if (pendingRequests.get(dedupeKey) === entry) {
+      entry.abort.abort();
+      pendingRequests.delete(dedupeKey);
+      console.warn("[proxy][TTL] aborted:", dedupeKey);
+    }
+  }, CONFIG.PENDING_TTL);
+
+  // Promise 正常完成时取消定时器并清理 Map
+  recipePromise.finally(() => {
+    if (pendingRequests.get(dedupeKey) === entry) {
+      clearTimeout(entry.timer);
+      pendingRequests.delete(dedupeKey);
+    }
+  });
+
+  const recipe = await recipePromise;
+  return buildResponseFromRecipe(recipe);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// probeUpstreamHead：HEAD 方法的轻量真实上游探测
+//
+// 不读取响应体，几乎零带宽消耗，转发真实状态码：
+//   上游 2xx → 200 / 上游 404 → 404 / 上游 429 → 429 / 超时 → 503
+// ─────────────────────────────────────────────────────────────────────────────
+async function probeUpstreamHead(target, fmt) {
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CONFIG.TIMEOUT_HEAD_PROBE);
+  try {
+    const res = await fetch(target, {
+      method:  "HEAD",
+      headers: buildUpstreamHeaders(fmt),
+      signal:  ctrl.signal,
+    });
+    return new Response(null, {
+      status:  res.ok ? 200 : res.status,
+      headers: proxyBaseHeaders("MISS"),
+    });
+  } catch {
+    return new Response(null, { status: 503, headers: proxyBaseHeaders("MISS") });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fetchImageRecipe：核心回源逻辑
+//
+// 返回 Recipe 纯数据结构（无 Stream），可被多个并发等待者独立消费：
+//   { kind: "ok",          headers: [[k,v],...], buffer: ArrayBuffer }
+//   { kind: "placeholder", proxyStatus: number,  message: string    }
+//   { kind: "forbidden",   text: string                              }
+//
+// 使用 ArrayBuffer 而非 Response：Response.body 是 ReadableStream 只能消费一次；
+// ArrayBuffer 可被多个 new Response() 独立使用，是请求去重的关键。
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchImageRecipe(reqBase, target, parsedTarget, fmt, cacheKey, cache, ctx, abortSignal) {
+
+  // 入口早返回：PENDING_TTL 可能在上方 cache.match 的 await 期间触发，
+  // 若进入时信号已中止，直接返回，不做任何回源操作
+  if (abortSignal.aborted) {
+    return { kind: "placeholder", proxyStatus: 503, message: "请求已取消" };
+  }
+
+  // 动态大小上限：含尺寸路径为缩略图，/s0/ 或无法识别为原图
+  const isThumbnail = /\/(s\d+(?:-c)?|w\d+(?:-h\d+)?(?:-c)?|h\d+)\//i.test(parsedTarget.pathname);
+  const maxBytes    = isThumbnail ? CONFIG.MAX_BYTES_THUMBNAIL : CONFIG.MAX_BYTES_ORIGINAL;
+
+  const upstreamHdrs = buildUpstreamHeaders(fmt);
+  const sources      = buildSources(parsedTarget, target);
+
+  // ── 阶段一：串行尝试主源 ──────────────────────────────────────────────────
+  // 主源成功率 > 90%，串行优先，只有失败时才启动备用源竞争，节省出站配额
+  const t0    = Date.now();
+  const res0  = await fetchUpstream(sources[0], upstreamHdrs, CONFIG.TIMEOUT_PRIMARY, abortSignal);
+  const latMs = Date.now() - t0;
+
+  // 429 熔断：Blogger CDN 按域名限速，同域名下所有路径同时受限，
+  // 继续尝试备用源毫无意义，立即返回避免触发更长封禁周期
+  if (res0?._rateLimited) {
+    console.warn("[proxy][429]", sources[0]);
+    return { kind: "placeholder", proxyStatus: 429, message: "请求过于频繁" };
+  }
+
+  // ── 阶段二：主源失败，并发竞争备用源 ──────────────────────────────────────
+  // fetchAny 内部为每个备用 URL 绑定独立 AbortController，
+  // 胜者出现后立即 abort 落败方，节省出站带宽配额
+  let usedFallback   = false;
+  let fallbackSource = null;
+  let res            = res0;
+
+  if ((!res || res._permanent) && sources.length > 1) {
+    const fb = await fetchAny(sources.slice(1), upstreamHdrs, CONFIG.TIMEOUT_FALLBACK, abortSignal);
+
+    // 备用源全部返回 429：同样熔断，返回 429 占位图，而非误报 502
+    if (fb?._rateLimited) {
+      console.warn("[proxy][429] fallback:", sources[1]);
+      return { kind: "placeholder", proxyStatus: 429, message: "请求过于频繁" };
+    }
+
+    if (fb) {
+      res            = fb.res;
+      fallbackSource = fb.sourceUrl;
+      usedFallback   = true;
+    }
+  }
+
+  // 所有源均失败
+  if (!res || res._permanent) {
+    console.error("[proxy][FAIL]", target);
+    return { kind: "placeholder", proxyStatus: 502, message: "图片加载失败" };
+  }
+
+  // ── Content-Type 宽松预校验 ───────────────────────────────────────────────
+  // 阻止上游 HTML 错误页、JSON 等非图片内容被透传给浏览器。
+  // application/octet-stream 是合法二进制流，允许通过，由魔数检测精确判断。
+  const upstreamCT = res.headers.get("content-type") || "";
+  if (upstreamCT && !upstreamCT.startsWith("image/") && upstreamCT !== "application/octet-stream") {
+    res.body?.cancel();  // 主动消费 body，释放 TCP 连接供连接池复用
+    console.warn("[proxy][CT]", upstreamCT, target);
+    return { kind: "forbidden", text: "非法内容类型" };
+  }
+
+  // ── Content-Length 预检 ───────────────────────────────────────────────────
+  // declaredLen 为 0 时跳过（chunked 编码不含 Content-Length），由 body 实际大小二次校验兜底。
+  // 预检的目的：对声明过大的响应提前拒绝，避免读取大量数据后才发现超限
+  const declaredLen = parseInt(res.headers.get("content-length") || "0", 10);
+  if (declaredLen > 0 && declaredLen > maxBytes) {
+    res.body?.cancel();  // 主动消费 body，释放 TCP 连接
+    console.warn("[proxy][SIZE] declared", declaredLen, target);
+    return { kind: "placeholder", proxyStatus: 413, message: "图片文件过大" };
+  }
+
+  // 读取完整响应体
+  const buffer = await res.arrayBuffer();
+
+  // body 实际大小二次校验（chunked 或 Content-Length 缺失时的兜底）
+  if (buffer.byteLength > maxBytes) {
+    console.warn("[proxy][SIZE] actual", buffer.byteLength, target);
+    return { kind: "placeholder", proxyStatus: 413, message: "图片文件过大" };
+  }
+
+  // ── 魔数检测：确定真实 MIME 类型 ─────────────────────────────────────────
+  // 读取前 12 字节二进制签名，不依赖 URL 后缀或 HTTP 响应头，准确率 100%。
+  // 解决 Blogger CDN 内容协商后有时未同步更新 Content-Type 头的问题
+  // （实际返回 WebP 但仍声明 image/jpeg）。
+  // 调用一次，结果被 fallback 校验和最终 CT 确定两处共享。
+  const detectedCT = detectMimeType(buffer);
+
+  // fallback 内容真实性双重校验：
+  // 备用源可能返回 CDN HTML 错误页（状态码 200 但内容为文本）。
+  //   校验一：魔数识别为已知图片格式
+  //   校验二：最小体积（100 字节）排除空响应和极短 HTML 错误文本
+  if (usedFallback) {
+    if (!detectedCT) {
+      console.warn("[proxy][FALLBACK] bad mime:", fallbackSource);
+      return { kind: "placeholder", proxyStatus: 502, message: "图片加载失败" };
+    }
+    if (buffer.byteLength < 100) {
+      console.warn("[proxy][FALLBACK] too small:", buffer.byteLength);
+      return { kind: "placeholder", proxyStatus: 502, message: "图片加载失败" };
+    }
+  }
+
+  // 最终 Content-Type：魔数（最可信）> 上游声明（最不可信）> 通用二进制类型
+  const finalCT = detectedCT ?? (upstreamCT || "application/octet-stream");
+
+  if (!finalCT.startsWith("image/")) {
+    console.warn("[proxy][CT] final not image:", finalCT, target);
+    return { kind: "forbidden", text: "非法内容类型" };
+  }
+
+  // ── 构造响应头 ────────────────────────────────────────────────────────────
+  const h = new Headers(res.headers);
+  h.delete("Set-Cookie");               // 防上游向用户浏览器种植 Cookie
+  h.delete("Content-Security-Policy"); // 图片响应不需要 CSP，避免干扰页面 CSP
+  h.delete("Content-Disposition");     // 防触发浏览器"另存为"弹窗
+
+  // fallback 命中用短缓存（5分钟），主源命中用长缓存（1年）。
+  // 主源缓存附加 immutable 指令，告知浏览器无需发送条件请求（If-None-Match 等）。
+  const ttl = usedFallback ? CONFIG.FALLBACK_CACHE_TTL : CONFIG.CACHE_TTL;
+
+  h.set("Content-Type",                finalCT);
+  h.set("Cache-Control",               `public, max-age=${ttl}${ttl === CONFIG.CACHE_TTL ? ", immutable" : ""}`);
+  h.set("Vary",                        "Accept");        // 告知下游 CDN 此响应依赖格式协商
+  h.set("Access-Control-Allow-Origin", "*");
+  h.set("Cross-Origin-Resource-Policy","cross-origin");
+  h.set("Timing-Allow-Origin",         "*");             // 允许前端 Performance API 读取耗时
+  h.set("X-Content-Type-Options",      "nosniff");       // 禁止浏览器 MIME 嗅探
+  h.set("X-Proxy-Version",             "v1.3");
+  h.set("X-Cache-Status",              "MISS");
+
+  if (!usedFallback) h.set("X-Upstream-Latency", `${latMs}ms`);
+  h.set("X-Proxy-Source", usedFallback ? "fallback" : "primary");
+  if (detectedCT && detectedCT !== upstreamCT && upstreamCT) {
+    h.set("X-Content-Type-Fixed", `upstream=${upstreamCT};detected=${detectedCT}`);
+  }
+
+  // ── 写入 Worker Cache ─────────────────────────────────────────────────────
+  // fallback 双写策略：
+  //   ① 写入 fallbackSource（/s0/ 原图）的 cacheKey，内容语义正确
+  //   ② 同时写入原始请求（如 /s800/）的 cacheKey，避免下次重走完整回源链路
+  //   两个 key 均使用 max-age=300（fallback 短缓存），h 的 Cache-Control 已是此值
+  // 主源命中时只写入原始 URL 的 cacheKey，缓存 1 年。
+  //
+  // ctx.waitUntil 保证响应返回后缓存写入仍能完成，不被请求结束中断
+  const writeCacheKey = usedFallback
+    ? buildCacheKey(reqBase, fallbackSource, fmt)
+    : cacheKey;
+
+  ctx.waitUntil(
+    cache.put(writeCacheKey, new Response(buffer, { status: 200, headers: new Headers(h) }))
+      .then(() => {
+        if (usedFallback) {
+          // h 的 Cache-Control 已是 max-age=300，直接复用，无需额外设置
+          return cache.put(cacheKey, new Response(buffer, { status: 200, headers: new Headers(h) }));
+        }
+      })
+      .catch(err => console.error("[proxy][CACHE]", err?.message))
+  );
+
+  return {
+    kind:    "ok",
+    headers: [...h.entries()], // 序列化为数组，每个等待者独立构造 Headers 实例
+    buffer,                    // ArrayBuffer 可被多个 new Response() 独立消费
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildResponseFromRecipe：Recipe 数据结构 → HTTP Response
+// ─────────────────────────────────────────────────────────────────────────────
+function buildResponseFromRecipe(recipe) {
+  switch (recipe.kind) {
+    case "ok":
+      return new Response(recipe.buffer, { status: 200, headers: new Headers(recipe.headers) });
+    case "placeholder":
+      return makePlaceholderResponse(recipe.proxyStatus, recipe.message);
+    case "forbidden":
+      return plainTextResponse(recipe.text, 403);
+    default:
+      return plainTextResponse("Internal Error", 500);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// buildSources：构建有序备用 URL 列表
+//
+// [0] 原始 URL（主源）
+// [1] 路径尺寸降级（备用源）：/sXXX/ /wXXX/ /hXXX/ → /s0/（Blogger 原图路径）
+// ─────────────────────────────────────────────────────────────────────────────
+function buildSources(parsedTarget, originalUrl) {
+  const sources     = [originalUrl];
+  const sizePattern = /(\/)(s\d+(?:-c)?|w\d+(?:-h\d+)?(?:-c)?|h\d+)(\/)/i;
+
+  if (sizePattern.test(parsedTarget.pathname)) {
+    try {
+      const u = new URL(originalUrl);
+      u.pathname = u.pathname.replace(sizePattern, "/s0/");
+      const fallback = u.toString();
+      if (fallback !== originalUrl) sources.push(fallback);
+    } catch { /* 静默忽略，主流程不受影响 */ }
+  }
+
+  return sources;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fetchUpstream：向单个 URL 发起 GET 请求（双路信号超时控制）
+//
+// 两路 abort 信号（任意一个触发即立即中止 fetch）：
+//   ① localCtrl  — 内部超时定时器
+//   ② externalSignal — 外部信号（PENDING_TTL 到期 或 fetchAny 竞争胜出）
+//
+// 非 2xx body 主动 cancel()：释放 TCP 连接供连接池复用，
+// 避免备用源失败频繁时造成连接积压
+//
+// 不设置 cf.cacheEverything：CF 内置缓存不感知 Accept 头，
+// 设置后会导致 avif/webp/base 三种格式互相覆盖缓存
+//
+// 返回值：
+//   Response          → 成功（2xx）
+//   { _permanent }    → 永久错误（404/410）
+//   { _rateLimited }  → 速率限制（429）
+//   null              → 临时错误（5xx）/ 超时 / 外部中止
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchUpstream(url, headers, timeoutMs, externalSignal = null) {
+  const localCtrl = new AbortController();
+  const timer     = setTimeout(() => localCtrl.abort(), timeoutMs);
+  const signal    = combineSignals(localCtrl.signal, externalSignal);
+
+  try {
+    const res = await fetch(url, { method: "GET", headers, signal });
+    if (res.ok) return res;
+    res.body?.cancel();  // 非 2xx：主动消费 body，释放 TCP 连接
+    if (res.status === 404 || res.status === 410) return { _permanent:   true };
+    if (res.status === 429)                       return { _rateLimited: true };
+    return null;
+  } catch {
+    return null;  // AbortError（超时/外部取消）或网络错误
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fetchAny：并发竞争多个备用源，返回最快成功的结果
+//
+// 竞争止损：胜者产生后立即 abort 所有落败连接，节省出站带宽配额。
+// winnerIdx 保护胜者连接不被 finally 块误 abort。
+// finally 块兜底：全部失败时也确保所有残余连接被清理。
+//
+// 429 精确传播：若所有备用源均返回 429，向上返回 { _rateLimited: true }，
+// 调用方输出 429 占位图，而非误报 502。
+//
+// 返回值：
+//   { res, sourceUrl }    → 最快成功的备用源响应及其 URL
+//   { _rateLimited: true } → 所有备用源均被限流
+//   null                  → 所有备用源均失败
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchAny(urls, headers, timeoutMs, externalSignal = null) {
+  if (!urls.length) return null;
+
+  const raceCtrls = urls.map(() => new AbortController());
+  let   winnerIdx = -1;
+
+  try {
+    const result = await Promise.any(
+      urls.map((url, i) => {
+        // 将竞争控制信号与外部取消信号合并后传入 fetchUpstream，
+        // fetchUpstream 内部再加入自身的超时信号，共两级合并
+        const extSig = combineSignals(raceCtrls[i].signal, externalSignal);
+        return fetchUpstream(url, headers, timeoutMs, extSig).then(res => {
+          if (res && !res._permanent && !res._rateLimited) {
+            raceCtrls.forEach((c, j) => { if (j !== i) c.abort(); });
+            winnerIdx = i;
+            return { res, sourceUrl: url };
+          }
+          // 限流单独标记，与普通失败区分，便于 AggregateError 中精确识别
+          if (res?._rateLimited) throw Object.assign(new Error("rate-limited"), { _rateLimited: true });
+          throw new Error("not ok");
+        });
+      })
+    );
+    return result;
+  } catch (err) {
+    // 若所有备用源均为限流失败，向上传播精确原因
+    if (err instanceof AggregateError && err.errors?.some(e => e._rateLimited)) {
+      return { _rateLimited: true };
+    }
+    return null;
+  } finally {
+    raceCtrls.forEach((c, i) => { if (i !== winnerIdx) c.abort(); });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// detectMimeType：魔数（Magic Bytes）检测真实 MIME 类型
+//
+// 读取前 12 字节二进制签名，不依赖 URL 后缀或 HTTP 响应头，准确率 100%。
+// 覆盖 Blogger CDN 实际下发的全部格式：WebP / JPEG / PNG / GIF / AVIF。
+//
+// 要求 byteLength ≥ 12：
+//   合法图片不可能小于 12 字节（最小 1x1 PNG 约 67 字节）；
+//   此校验同时保证后续所有字节访问安全，无越界风险。
+//
+// AVIF 精确 brand 校验（bytes[8..11]）：
+//   ISO BMFF 格式（AVIF/HEIF/MP4 等）的 bytes[4..7] 均为 "ftyp"，
+//   必须读取 bytes[8..11] 的 major brand 才能确认是 AVIF：
+//     "avif" → 静态 AVIF / "avis" → AVIF 图片序列
+//   其他 brand（heic/isom/mp41 等）返回 null，拒绝透传
+// ─────────────────────────────────────────────────────────────────────────────
+function detectMimeType(buffer) {
+  if (!buffer || buffer.byteLength < 12) return null;
+
+  const b = new Uint8Array(buffer, 0, 12);
+
+  // WebP：RIFF????WEBP
+  if (b[0]===0x52&&b[1]===0x49&&b[2]===0x46&&b[3]===0x46&&
+      b[8]===0x57&&b[9]===0x45&&b[10]===0x42&&b[11]===0x50) return "image/webp";
+
+  // JPEG：FF D8 FF
+  if (b[0]===0xFF&&b[1]===0xD8&&b[2]===0xFF) return "image/jpeg";
+
+  // PNG：89 50 4E 47
+  if (b[0]===0x89&&b[1]===0x50&&b[2]===0x4E&&b[3]===0x47) return "image/png";
+
+  // GIF：47 49 46（GIF87a / GIF89a）
+  if (b[0]===0x47&&b[1]===0x49&&b[2]===0x46) return "image/gif";
+
+  // ISO BMFF：bytes 4-7 = "ftyp"，需进一步读取 major brand
+  if (b[4]===0x66&&b[5]===0x74&&b[6]===0x79&&b[7]===0x70) {
+    const brand = String.fromCharCode(b[8], b[9], b[10], b[11]);
+    if (brand === "avif" || brand === "avis") return "image/avif";
+    return null;
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// makePlaceholderResponse：生成 SVG 格式的占位图响应
+//
+// 始终返回 HTTP 200，避免 <img> 标签显示系统破图图标。
+// X-Proxy-Status 记录真实错误码，供监控系统采集。
+// 动态内容经完整 XML 转义，防止 SVG 注入（XSS）攻击。
+// ─────────────────────────────────────────────────────────────────────────────
+function makePlaceholderResponse(status, message = "图片暂时无法显示") {
+  const safeMsg  = String(message)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  const safeCode = String(status).replace(/[<>&]/g,"");
+  const { PLACEHOLDER_W: w, PLACEHOLDER_H: h } = CONFIG;
+
+  const svg = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">`,
+    `<rect width="${w}" height="${h}" fill="#f8f9fa"/>`,
+    `<text x="${w/2}" y="${h*.44}" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#6c757d">${safeMsg}</text>`,
+    `<text x="${w/2}" y="${h*.56}" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#adb5bd">HTTP ${safeCode} · ZOIO.NET</text>`,
+    `</svg>`,
+  ].join("");
+
+  return new Response(svg, {
+    status: 200,
+    headers: {
+      "Content-Type":                "image/svg+xml; charset=utf-8",
+      "Cache-Control":               `public, max-age=${CONFIG.PLACEHOLDER_TTL}`,
+      "X-Proxy-Status":              String(status),
+      "X-Proxy-Version":             "v1.3",
+      "X-Robots-Tag":                "noindex",
+      "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options":      "nosniff",
+    },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// combineSignals：将两个 AbortSignal 合并为一个（任意一个 abort 即触发）
+//
+// 优先使用 AbortSignal.any()（CF Workers V8 / Chrome 116+ 原生支持，性能最优）；
+// 降级路径供本地旧版 miniflare 开发调试使用，生产环境不会执行。
+// 手动合并使用互相清理监听器（双向 removeEventListener），杜绝悬挂监听器。
+// ─────────────────────────────────────────────────────────────────────────────
+function combineSignals(a, b) {
+  if (!b) return a;  // 无外部信号时直接返回主信号，避免冗余封装
+  if (typeof AbortSignal.any === "function") return AbortSignal.any([a, b]);
+
+  // 降级：手动合并
+  const ctrl = new AbortController();
+  if (a.aborted || b.aborted) { ctrl.abort(); return ctrl.signal; }
+  const abort = () => {
+    a.removeEventListener("abort", abort);
+    b.removeEventListener("abort", abort);
+    ctrl.abort();
+  };
+  a.addEventListener("abort", abort);
+  b.addEventListener("abort", abort);
+  return ctrl.signal;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 工具函数
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * buildCacheKey：构造规范化 Worker Cache 缓存键
+ * 格式：{origin+pathname}?url={encodeURIComponent(target)}&fmt={fmt}
+ *   url 参数：消除 URL 编码差异（%2F vs /）导致的缓存分裂
+ *   fmt 参数：隔离 avif/webp/base 三种格式的缓存槽位
+ */
+function buildCacheKey(reqBase, target, fmt) {
+  return new Request(
+    `${reqBase}?url=${encodeURIComponent(target)}&fmt=${fmt}`,
+    { method: "GET" }
+  );
+}
+
+/**
+ * buildUpstreamHeaders：构造向 Blogger CDN 发送的上游请求头
+ * Accept 按 fmt 分级，是触发 AVIF/WebP 内容协商的关键
+ */
+function buildUpstreamHeaders(fmt) {
+  return new Headers({
+    "User-Agent":      CONFIG.UPSTREAM_UA,
+    "Referer":         CONFIG.UPSTREAM_REFERER,
+    "Accept":          FMT_ACCEPT[fmt],
+    "Accept-Language": "en-US,en;q=0.9",
+  });
+}
+
+/**
+ * proxyBaseHeaders：通用基础响应头（HEAD 探测等轻量场景复用）
+ * Access-Control-Allow-Origin 对 HEAD 同样必要：
+ * 跨域 JS fetch HEAD 请求若无 CORS 头，前端无法读取响应头
+ */
+function proxyBaseHeaders(cacheStatus) {
+  return {
+    "X-Cache-Status":              cacheStatus,
+    "X-Proxy-Version":             "v1.3",
+    "X-Content-Type-Options":      "nosniff",
+    "Access-Control-Allow-Origin": "*",
+  };
+}
+
+/**
+ * normalizeUrl：容错处理多种 URL 格式，返回 URL 对象（失败返回 null）
+ * 支持：完整 URL / 省略协议（//host）/ 纯域名（host/path）
+ */
+function normalizeUrl(raw) {
+  try {
+    let href = decodeURIComponent(raw.trim());
+    if (!/^https?:\/\//i.test(href)) {
+      href = href.startsWith("//") ? "https:" + href : "https://" + href;
+    }
+    return new URL(href);
+  } catch {
+    return null;
+  }
+}
+
+/** 上游域名白名单：精确匹配或子域名匹配 */
+function isAllowedUpstreamHost(host) {
+  const h = host.toLowerCase();
+  return CONFIG.ALLOWED_UPSTREAM_HOSTS.some(d => h === d || h.endsWith("." + d));
+}
+
+/** Referer 白名单：空 host（无 Referer）默认放行 */
+function isAllowedRefererHost(host) {
+  if (!host) return true;
+  const h = host.toLowerCase();
+  return CONFIG.ALLOWED_REFERER_HOSTS.some(d => h === d || h.endsWith("." + d));
+}
+
+/** 安全提取 URL 的 hostname，解析失败返回空字符串 */
+function getHostname(url) {
+  try { return new URL(url).hostname.toLowerCase(); }
+  catch { return ""; }
+}
+
+/** 纯文本响应快捷方法 */
+function plainTextResponse(text, status, extraHeaders = {}) {
+  return new Response(text, {
+    status,
+    headers: {
+      "Content-Type":    "text/plain; charset=utf-8",
+      "X-Proxy-Version": "v1.3",
+      ...extraHeaders,
+    },
+  });
+}
+
+/** 无 ?url= 参数时的服务说明落地页（10 秒后跳转主站） */
+function landingPageResponse() {
+  return new Response(
+    `<!DOCTYPE html><html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="10;url=https://www.zoio.net">
+<meta name="robots" content="noindex">
+<link rel="shortcut icon" href="https://www.zoio.net/favicon.ico">
+<title>ZOIO.NET 图片 CDN</title>
+<style>body{font-family:sans-serif;line-height:1.6;padding:20px;max-width:600px;margin:auto;background:#fff;}h1{color:#0e2045;border-bottom:1px solid #eaeff7;padding-bottom:10px;}p,a{color:#0e2045;}a{color:#2563eb;}hr{border:0;height:1px;background:#eaeff7;margin:10px 0;}code{background:#e0e0e0;padding:2px 4px;border-radius:4px;font-size:.9em;}.countdown-box{margin-top:15px;padding:10px;background:#eef2ff;border-radius:6px;color:#2563eb;font-size:.9em;text-align:center;}.timer{font-weight:bold;font-size:1.1em;}</style>
+</head><body>
+<h2>ZOIO.NET 图片 CDN 加速服务</h2>
+<p>您当前访问的 <code>img.zoio.net</code> 是「科学上网 · <a href="https://www.zoio.net/">ZOIO.NET</a>」专用图片反向代理与 CDN 加速节点。</p>
+<p>我们依托 Cloudflare 边缘网络技术，确保主站图片在全球范围内都能实现快速、稳定的加载。</p>
+<p>声明：本服务为私有内容分发接口，不支持公共图片上传或托管。</p>
+<hr>
+<p>期待在主站与您相遇，继续您的科学上网探索之旅！</p>
+<p>访问主站：<a href="https://www.zoio.net/">www.zoio.net</a></p>
+<div class="countdown-box">页面将在10秒后自动跳转至主站...</div>
+</body></html>`,
+    { status: 200, headers: {
+      "Content-Type":           "text/html; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options":        "SAMEORIGIN",
+      "Referrer-Policy":        "no-referrer",
+    }});
+}
