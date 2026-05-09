@@ -13,10 +13,10 @@
 
 // 外部 API 地址常量（不可修改）
 const STATIC = Object.freeze({
-  CFGRAPHQLURL:  "https://api.cloudflare.com/client/v4/graphql",
-  TGAPIBASE:     "https://api.telegram.org",
-  BLOGGERAPI:    "https://www.googleapis.com/blogger/v3",
-  OAUTHTOKENURL: "https://oauth2.googleapis.com/token",
+  CF_GRAPHQL_URL:  "https://api.cloudflare.com/client/v4/graphql",
+  TG_API_BASE:     "https://api.telegram.org",
+  BLOGGER_API:     "https://www.googleapis.com/blogger/v3",
+  OAUTH_TOKEN_URL: "https://oauth2.googleapis.com/token",
 });
 
 // Workers 免费额度（每 UTC 自然日重置）
@@ -26,23 +26,23 @@ const QUOTA = Object.freeze({
 
 // 各项指标的告警阈值
 const THRESHOLD = Object.freeze({
-  REQNOTICE:       0.60,   // 请求量提示阈值（占免费额度比例）
-  REQWARN:         0.70,   // 请求量预警阈值
-  REQALERT:        0.90,   // 请求量紧急告警阈值
-  CPUWARNMS:       7,      // CPU 耗时预警（毫秒，P50/P99 共用）
-  CPUALERTMS:      10,     // CPU 耗时紧急告警（毫秒，P50/P99 共用）
-  CPUP999WARNMS:   50,     // CPU P999 预警（毫秒）—— P999 天然高于 P99，使用独立阈值
-  CPUP999ALERTMS:  100,    // CPU P999 紧急告警（毫秒）
-  ERRWARN:         0.01,   // 错误率预警（1%）
-  ERRALERT:        0.05,   // 错误率紧急告警（5%）
-  DURWARNMS:       500,    // 请求延迟预警（毫秒）
-  DURALERTMS:      2000,   // 请求延迟紧急告警（毫秒）
-  REMWARNHOURS:    8,      // 剩余额度预警时长（小时）
-  REMALERTHOURS:   4,      // 剩余额度紧急告警时长（小时）
-  SUBREQWARN:      30,     // 平均出站请求预警（次/请求）
-  SUBREQALERT:     45,     // 平均出站请求紧急告警（次/请求）
-  OFFLINEUTCHOUR:  2,      // UTC 几点之后，0 请求才视为"疑似离线"
-  TRENDPCT:        0.05,   // Blogger 流量趋势判断偏差阈值（5%）
+  REQ_NOTICE:         0.60,   // 请求量提示阈值（占免费额度比例）
+  REQ_WARN:           0.70,   // 请求量预警阈值
+  REQ_ALERT:          0.90,   // 请求量紧急告警阈值
+  CPU_WARN_MS:        7,      // CPU 耗时预警（毫秒，P50/P99 共用）
+  CPU_ALERT_MS:       10,     // CPU 耗时紧急告警（毫秒，P50/P99 共用）
+  CPU_P999_WARN_MS:   50,     // CPU P999 预警（毫秒）—— P999 天然高于 P99，使用独立阈值
+  CPU_P999_ALERT_MS:  100,    // CPU P999 紧急告警（毫秒）
+  ERR_WARN:           0.01,   // 错误率预警（1%）
+  ERR_ALERT:          0.05,   // 错误率紧急告警（5%）
+  DUR_WARN_MS:        500,    // 请求延迟预警（毫秒）
+  DUR_ALERT_MS:       2000,   // 请求延迟紧急告警（毫秒）
+  REM_WARN_HOURS:     8,      // 剩余额度预警时长（小时）
+  REM_ALERT_HOURS:    4,      // 剩余额度紧急告警时长（小时）
+  SUBREQ_WARN:        30,     // 平均出站请求预警（次/请求）
+  SUBREQ_ALERT:       45,     // 平均出站请求紧急告警（次/请求）
+  OFFLINE_UTC_HOUR:   2,      // UTC 几点之后，0 请求才视为"疑似离线"
+  TREND_PCT:          0.05,   // Blogger 流量趋势判断偏差阈值（5%）
 });
 
 // 健康评分各维度权重（总计 1.0）
@@ -54,7 +54,7 @@ const HEALTH_WEIGHT = Object.freeze({
 });
 
 // 告警冷却时间（同级别告警至少间隔 2 小时，防止消息轰炸）
-const ALERTCOOLDOWNMS = 2 * 60 * 60 * 1000;
+const ALERT_COOLDOWN_MS = 2 * 60 * 60 * 1000;
 
 // KV 存储 Key 定义（集中管理，避免散落在代码各处）
 const KV_KEY = Object.freeze({
@@ -165,8 +165,8 @@ function esc(s) {
 
 /** CPU 耗时图标（P50 / P99 使用，阈值：7ms / 10ms） */
 function cpuIcon(ms) {
-  if (ms >= THRESHOLD.CPUALERTMS) return "🔴";
-  if (ms >= THRESHOLD.CPUWARNMS)  return "🟡";
+  if (ms >= THRESHOLD.CPU_ALERT_MS) return "🔴";
+  if (ms >= THRESHOLD.CPU_WARN_MS)  return "🟡";
   return "🟢";
 }
 
@@ -176,43 +176,43 @@ function cpuIcon(ms) {
  * 避免与 P99 共用阈值导致 CPU Max 行几乎永远显示红色
  */
 function cpuMaxIcon(ms) {
-  if (ms >= THRESHOLD.CPUP999ALERTMS) return "🔴";
-  if (ms >= THRESHOLD.CPUP999WARNMS)  return "🟡";
+  if (ms >= THRESHOLD.CPU_P999_ALERT_MS) return "🔴";
+  if (ms >= THRESHOLD.CPU_P999_WARN_MS)  return "🟡";
   return "🟢";
 }
 
 /** 错误率图标（阈值：1% / 5%） */
 function errIcon(rate) {
-  if (rate >= THRESHOLD.ERRALERT) return "🔴";
-  if (rate >= THRESHOLD.ERRWARN)  return "🟡";
+  if (rate >= THRESHOLD.ERR_ALERT) return "🔴";
+  if (rate >= THRESHOLD.ERR_WARN)  return "🟡";
   return "🟢";
 }
 
 /** 请求额度占比图标 */
 function reqIcon(ratio) {
-  if (ratio >= THRESHOLD.REQALERT) return "🔴";
-  if (ratio >= THRESHOLD.REQWARN)  return "🟡";
+  if (ratio >= THRESHOLD.REQ_ALERT) return "🔴";
+  if (ratio >= THRESHOLD.REQ_WARN)  return "🟡";
   return "🟢";
 }
 
 /** 剩余额度预计耗尽时长图标 */
 function remIcon(hoursLeft) {
-  if (hoursLeft < THRESHOLD.REMALERTHOURS) return "🔴";
-  if (hoursLeft < THRESHOLD.REMWARNHOURS)  return "🟡";
+  if (hoursLeft < THRESHOLD.REM_ALERT_HOURS) return "🔴";
+  if (hoursLeft < THRESHOLD.REM_WARN_HOURS)  return "🟡";
   return "🟢";
 }
 
 /** 请求延迟图标（阈值：500ms / 2000ms） */
 function durIcon(ms) {
-  if (ms >= THRESHOLD.DURALERTMS) return "🔴";
-  if (ms >= THRESHOLD.DURWARNMS)  return "🟡";
+  if (ms >= THRESHOLD.DUR_ALERT_MS) return "🔴";
+  if (ms >= THRESHOLD.DUR_WARN_MS)  return "🟡";
   return "🟢";
 }
 
 /** 平均出站请求数图标（阈值：30 / 45 次/请求） */
 function subIcon(avg) {
-  if (avg >= THRESHOLD.SUBREQALERT) return "🔴";
-  if (avg >= THRESHOLD.SUBREQWARN)  return "🟡";
+  if (avg >= THRESHOLD.SUBREQ_ALERT) return "🔴";
+  if (avg >= THRESHOLD.SUBREQ_WARN)  return "🟡";
   return "🟢";
 }
 
@@ -353,10 +353,10 @@ function calcHealthScore(total, workers, now) {
     return Math.round(100 - 20 * (value / warn));
   }
 
-  const sErr   = segScore(worstErrRate, THRESHOLD.ERRWARN,  THRESHOLD.ERRALERT);
-  const sCpu   = segScore(worstCpuP99,  THRESHOLD.CPUWARNMS, THRESHOLD.CPUALERTMS);
-  const sDur   = segScore(worstDurP99,  THRESHOLD.DURWARNMS, THRESHOLD.DURALERTMS);
-  const sQuota = segScore(ratio,        THRESHOLD.REQWARN,   THRESHOLD.REQALERT);
+  const sErr   = segScore(worstErrRate, THRESHOLD.ERR_WARN,  THRESHOLD.ERR_ALERT);
+  const sCpu   = segScore(worstCpuP99,  THRESHOLD.CPU_WARN_MS, THRESHOLD.CPU_ALERT_MS);
+  const sDur   = segScore(worstDurP99,  THRESHOLD.DUR_WARN_MS, THRESHOLD.DUR_ALERT_MS);
+  const sQuota = segScore(ratio,        THRESHOLD.REQ_WARN,   THRESHOLD.REQ_ALERT);
 
   let score = Math.round(
     sErr   * HEALTH_WEIGHT.ERROR +
@@ -370,11 +370,11 @@ function calcHealthScore(total, workers, now) {
   const utcHour = now.getUTCHours();
   const hasCriticalDown = workers.some(w =>
     w.critical && (
-      w.cpuP99    >= THRESHOLD.CPUALERTMS  ||
-      w.errorRate >= THRESHOLD.ERRALERT    ||
-      w.durP99    >= THRESHOLD.DURALERTMS  ||
+      w.cpuP99    >= THRESHOLD.CPU_ALERT_MS  ||
+      w.errorRate >= THRESHOLD.ERR_ALERT    ||
+      w.durP99    >= THRESHOLD.DUR_ALERT_MS  ||
       // 保护窗口结束后请求数仍为 0，才视为离线
-      (w.requests === 0 && utcHour >= THRESHOLD.OFFLINEUTCHOUR)
+      (w.requests === 0 && utcHour >= THRESHOLD.OFFLINE_UTC_HOUR)
     )
   );
   if (hasCriticalDown) score = Math.min(score, 49);
@@ -471,7 +471,7 @@ function buildCFQuery(accountId, startTime, endTime) {
  * @throws  拉取失败或响应含 errors 时抛出异常
  */
 async function fetchCFAnalytics(accountId, apiToken, startTime, endTime) {
-  const resp = await fetchWithRetry(STATIC.CFGRAPHQLURL, {
+  const resp = await fetchWithRetry(STATIC.CF_GRAPHQL_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -601,7 +601,7 @@ async function getOAuthAccessToken(env) {
   }
 
   // 使用 Refresh Token 向 Google OAuth 换取新的 Access Token
-  const resp = await fetchWithRetry(STATIC.OAUTHTOKENURL, {
+  const resp = await fetchWithRetry(STATIC.OAUTH_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -649,7 +649,7 @@ async function getOAuthAccessToken(env) {
  * @returns {number} 该范围内的 PV 总计
  */
 async function fetchBloggerPV(blogId, accessToken, range) {
-  const url  = `${STATIC.BLOGGERAPI}/blogs/${blogId}/pageviews?range=${range}`;
+  const url  = `${STATIC.BLOGGER_API}/blogs/${blogId}/pageviews?range=${range}`;
   const resp = await fetchWithRetry(url, {
     headers: {
       "Authorization": `Bearer ${accessToken}`,
@@ -791,7 +791,9 @@ async function calcTodayPV(kv, todayTotal, bjDate) {
     if (diff < 0) return { todayPV: null, status: "anomaly", baseDate: bjDate };
     return {
       todayPV:  diff,
-      status:   base.source === "cold-start" ? "cold" : "ok",
+      // cold-start：基线刚以当前总量建立，diff=0 是真实值，直接显示。
+      // 下次执行时基线已存在，计算结果即为真实今日增量。
+      status:   "ok",
       baseDate: bjDate,
     };
   } catch {
@@ -906,8 +908,8 @@ function buildBloggerBlock(blogger, todayPV, todayStatus, siteName, reportDateBj
     ? (((blogger.avg7 / blogger.avg30) - 1) * 100).toFixed(1)
     : "0.0";
   const trendStr  = parseFloat(trendPct) >= 0 ? `+${trendPct}%` : `${trendPct}%`;
-  const trendIcon = blogger.avg7 > blogger.avg30 * (1 + THRESHOLD.TRENDPCT) ? "📈"
-                  : blogger.avg7 < blogger.avg30 * (1 - THRESHOLD.TRENDPCT) ? "📉" : "➡️";
+  const trendIcon = blogger.avg7 > blogger.avg30 * (1 + THRESHOLD.TREND_PCT) ? "📈"
+                  : blogger.avg7 < blogger.avg30 * (1 - THRESHOLD.TREND_PCT) ? "📉" : "➡️";
 
   return [
     `─────────────────`,
@@ -1018,10 +1020,10 @@ function buildAlert(cfData, health, now, env, isCritical) {
   const elapsed   = Math.max(now.getUTCHours() + now.getUTCMinutes() / 60, 2);
 
   // 根据告警级别选取对应阈值
-  const reqThreshold = isCritical ? THRESHOLD.REQALERT   : THRESHOLD.REQWARN;
-  const cpuThreshold = isCritical ? THRESHOLD.CPUALERTMS  : THRESHOLD.CPUWARNMS;
-  const errThreshold = isCritical ? THRESHOLD.ERRALERT    : THRESHOLD.ERRWARN;
-  const durThreshold = isCritical ? THRESHOLD.DURALERTMS  : THRESHOLD.DURWARNMS;
+  const reqThreshold = isCritical ? THRESHOLD.REQ_ALERT   : THRESHOLD.REQ_WARN;
+  const cpuThreshold = isCritical ? THRESHOLD.CPU_ALERT_MS  : THRESHOLD.CPU_WARN_MS;
+  const errThreshold = isCritical ? THRESHOLD.ERR_ALERT    : THRESHOLD.ERR_WARN;
+  const durThreshold = isCritical ? THRESHOLD.DUR_ALERT_MS  : THRESHOLD.DUR_WARN_MS;
   const title        = isCritical ? "紧急告警" : "运行预警";
 
   const issueBlocks = [];
@@ -1079,7 +1081,7 @@ function buildOfflineAlert(worker, now, env) {
     `${fmtBjShort(now)}  |  ${fmtUtcShort(now)}`,
     ``,
     `疑似离线：${esc(worker.alias)} · ${esc(worker.name)}`,
-    `今日请求数为零（UTC ${THRESHOLD.OFFLINEUTCHOUR}:00 后未见流量）`,
+    `今日请求数为零（UTC ${THRESHOLD.OFFLINE_UTC_HOUR}:00 后未见流量）`,
     ``,
     `排查项目`,
     `Worker 是否部署正常`,
@@ -1135,20 +1137,20 @@ function selectTemplate(cfData, blogger, todayPVResult, health, now, isDailyRepo
 
   // 检测是否有指标触达紧急告警阈值
   const hasCritical =
-    total.ratio >= THRESHOLD.REQALERT ||
+    total.ratio >= THRESHOLD.REQ_ALERT ||
     workers.some(w =>
-      w.cpuP99    >= THRESHOLD.CPUALERTMS ||
-      w.errorRate >= THRESHOLD.ERRALERT   ||
-      w.durP99    >= THRESHOLD.DURALERTMS
+      w.cpuP99    >= THRESHOLD.CPU_ALERT_MS ||
+      w.errorRate >= THRESHOLD.ERR_ALERT   ||
+      w.durP99    >= THRESHOLD.DUR_ALERT_MS
     );
 
   // 检测是否有指标触达预警阈值
   const hasWarning =
-    total.ratio >= THRESHOLD.REQWARN ||
+    total.ratio >= THRESHOLD.REQ_WARN ||
     workers.some(w =>
-      w.cpuP99    >= THRESHOLD.CPUWARNMS ||
-      w.errorRate >= THRESHOLD.ERRWARN   ||
-      w.durP99    >= THRESHOLD.DURWARNMS
+      w.cpuP99    >= THRESHOLD.CPU_WARN_MS ||
+      w.errorRate >= THRESHOLD.ERR_WARN   ||
+      w.durP99    >= THRESHOLD.DUR_WARN_MS
     );
 
   if (isDailyReport) {
@@ -1194,7 +1196,7 @@ function truncateTG(text, suffix = "\n\n<i>⚠️ 内容过长已截断，请前
  * @returns {number} 成功发送的消息 ID（用于后续原地编辑）
  */
 async function sendTGMessage(botToken, chatId, text) {
-  const resp = await fetchWithRetry(`${STATIC.TGAPIBASE}/bot${botToken}/sendMessage`, {
+  const resp = await fetchWithRetry(`${STATIC.TG_API_BASE}/bot${botToken}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1216,7 +1218,7 @@ async function sendTGMessage(botToken, chatId, text) {
  * error_code 400 通常表示消息内容与当前相同，静默忽略即可
  */
 async function editTGMessage(botToken, chatId, messageId, text) {
-  const resp = await fetchWithRetry(`${STATIC.TGAPIBASE}/bot${botToken}/editMessageText`, {
+  const resp = await fetchWithRetry(`${STATIC.TG_API_BASE}/bot${botToken}/editMessageText`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1242,7 +1244,7 @@ async function editTGMessage(botToken, chatId, messageId, text) {
  */
 async function answerCallbackQuery(botToken, callbackQueryId, text = "") {
   try {
-    const resp = await fetch(`${STATIC.TGAPIBASE}/bot${botToken}/answerCallbackQuery`, {
+    const resp = await fetch(`${STATIC.TG_API_BASE}/bot${botToken}/answerCallbackQuery`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ callback_query_id: callbackQueryId, text, show_alert: false }),
@@ -1310,7 +1312,7 @@ async function saveLastAlert(kv, level, time) {
  *   - newLevel = "none"                    → 永不发送
  *   - lastAlert 为空                        → 立即发送（首次告警）
  *   - newLevel 升级（warn → critical）      → 立即发送（不受冷却限制）
- *   - 同级别且距上次发送 < ALERTCOOLDOWNMS  → 跳过（冷却中）
+ *   - 同级别且距上次发送 < ALERT_COOLDOWN_MS  → 跳过（冷却中）
  *   - 同级别且冷却时间已过                  → 发送
  *
  * @param {object|null} lastAlert  上次告警记录 { level, time }
@@ -1324,7 +1326,7 @@ function shouldSendAlert(lastAlert, newLevel, now) {
   // 告警级别升级，立即推送
   if (newLevel === "critical" && lastLevel !== "critical") return true;
   // 同级别冷却中，跳过
-  if (lastLevel === newLevel && now - Number(lastTime) < ALERTCOOLDOWNMS) return false;
+  if (lastLevel === newLevel && now - Number(lastTime) < ALERT_COOLDOWN_MS) return false;
   return true;
 }
 
@@ -1355,7 +1357,7 @@ async function runMonitor(env, isDailyReport = true, nowArg = null) {
   // 检测疑似离线的 critical Worker（UTC OFFLINEUTCHOUR 之后请求数仍为 0）
   const utcHour        = now.getUTCHours();
   const offlineWorkers = cfData.workers.filter(
-    w => w.critical && w.requests === 0 && utcHour >= THRESHOLD.OFFLINEUTCHOUR
+    w => w.critical && w.requests === 0 && utcHour >= THRESHOLD.OFFLINE_UTC_HOUR
   );
 
   let sent = false;
@@ -1391,7 +1393,7 @@ async function runMonitor(env, isDailyReport = true, nowArg = null) {
         if (raw) {
           const lastTime = Number(JSON.parse(raw));
           // 仍在冷却期内，跳过该 Worker 的离线告警
-          if (now.getTime() - lastTime < ALERTCOOLDOWNMS) return;
+          if (now.getTime() - lastTime < ALERT_COOLDOWN_MS) return;
         }
         sendTasks.push(
           sendTGMessage(env.TG_BOT_TOKEN, env.TG_CHAT_ID, buildOfflineAlert(w, now, env)).catch(() => {})
@@ -1546,9 +1548,14 @@ export default {
  */
 async function handleWebhook(request, env) {
   // 第一层：验证 Webhook Secret，防止非 Telegram 来源的伪造 POST 请求
-  const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
-  if (incomingSecret !== (env.TG_WEBHOOK_SECRET ?? "")) {
-    return new Response("Forbidden", { status: 403 });
+  // 注意：TG_WEBHOOK_SECRET 未配置时跳过校验（降级为无鉴权模式），
+  // 建议在 TG 注册 Webhook 时传入 secret_token 并配置此环境变量。
+  if (env.TG_WEBHOOK_SECRET) {
+    const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
+    if (incomingSecret !== env.TG_WEBHOOK_SECRET) {
+      console.warn("handleWebhook: secret-token mismatch, request rejected");
+      return new Response("Forbidden", { status: 403 });
+    }
   }
 
   // 第二层：校验必填环境配置
@@ -1663,7 +1670,9 @@ async function runVerify(env) {
     const missing = ["BLOGGER_BLOG_ID","BLOGGER_CLIENT_ID","BLOGGER_CLIENT_SECRET","BLOGGER_REFRESH_TOKEN"]
       .filter(k => !env[k]);
     results.push({
-      ok:   missing.length === 4,   // 四项全缺视为"未配置"（正常），部分缺失视为"配置不完整"
+      // missing.length === 4：四项全缺 → 用户完全没配置 Blogger，属于正常的"未启用"状态
+      // missing.length  < 4：部分缺失 → 配置不完整，属于错误，需要提示修复
+      ok:   missing.length === 4,
       name: "Blogger API v3",
       msg:  missing.length === 4
         ? "未配置（可选功能，不影响 CF 监控）"
@@ -1686,7 +1695,7 @@ async function runVerify(env) {
 
   // 检测 Telegram Webhook 注册状态
   try {
-    const resp  = await fetch(`${STATIC.TGAPIBASE}/bot${env.TG_BOT_TOKEN}/getWebhookInfo`);
+    const resp  = await fetch(`${STATIC.TG_API_BASE}/bot${env.TG_BOT_TOKEN}/getWebhookInfo`);
     const data  = await resp.json();
     const whUrl = data?.result?.url ?? "";
     results.push({
